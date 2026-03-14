@@ -1,0 +1,38 @@
+[project]
+name = "latexcop"
+version = "1.0.0"
+description = "Automated periodical character-diff tracking for LaTeX papers via Git history"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+keywords = ["latex", "progress", "tracking", "academic", "git"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing :: Markup :: LaTeX",
+]
+dependencies = [
+    "python-dotenv>=1.2.2",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+]
