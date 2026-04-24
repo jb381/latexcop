@@ -1,6 +1,7 @@
 import csv
 import datetime
 import difflib
+import json
 import logging
 import os
 import re
@@ -74,6 +75,7 @@ class ProgressRecord:
     Start: str
     End: str
     DiffChars: int
+    CommitCount: int
     TargetMet: str
     Locked: str
 
@@ -106,6 +108,32 @@ def get_commit_before(timestamp: datetime.datetime, config: Config) -> str | Non
         return None
 
     return run_git_command(["rev-list", "-n", "1", f"--before={ts_str}", "HEAD"], config.repo_dir)
+
+
+def get_commit_count_between(
+    start: datetime.datetime, end: datetime.datetime, config: Config
+) -> int:
+    """
+    Counts commits touching the tracked file in the given time window.
+    """
+    start_str = start.strftime("%Y-%m-%d %H:%M:%S")
+    end_str = end.strftime("%Y-%m-%d %H:%M:%S")
+    output = run_git_command(
+        [
+            "rev-list",
+            "--count",
+            f"--after={start_str}",
+            f"--before={end_str}",
+            "HEAD",
+            "--",
+            config.file_path,
+        ],
+        config.repo_dir,
+    )
+    try:
+        return int(output or "0")
+    except ValueError:
+        return 0
 
 
 def get_file_content_at_commit(commit: str, filepath: str, config: Config) -> str:
@@ -166,37 +194,71 @@ def char_diff(text1: str, text2: str) -> int:
     return diff
 
 
-def auto_pull(config: Config) -> None:
+def auto_pull(config: Config) -> list[str]:
     """
     Attempts to fetch and fast-forward pull from the remote repository.
     """
+    warnings = []
     remotes = run_git_command(["remote"], config.repo_dir)
     if not remotes:
-        return
+        return warnings
 
     logger.info("Fetching latest changes from remote...")
     if run_git_command(["fetch"], config.repo_dir) is None:
-        logger.warning("Could not fetch from remote.")
-        return
+        message = "Could not fetch from remote."
+        logger.warning(message)
+        warnings.append(message)
+        return warnings
 
     logger.info("Attempting to pull (fast-forward only)...")
     if run_git_command(["merge", "--ff-only"], config.repo_dir) is None:
-        logger.warning("Could not auto-pull from remote (branch diverged or uncommitted changes).")
+        message = "Could not auto-pull from remote (branch diverged or uncommitted changes)."
+        logger.warning(message)
+        warnings.append(message)
     else:
         logger.info("Successfully pulled latest changes.")
+    return warnings
 
 
-def check_uncommitted_changes(config: Config) -> None:
+def check_uncommitted_changes(config: Config) -> list[str]:
     """
     Checks if there are uncommitted changes to FILE_PATH and warns the user.
     """
+    warnings = []
     status = run_git_command(["status", "--porcelain", config.file_path], config.repo_dir)
     if status:
-        logger.warning("You have uncommitted changes in '%s'!", config.file_path)
-        logger.warning(
-            "These changes are included in the 'Current' diff, but they will NOT be locked "
-            "in history until you commit them. Don't forget to commit and push!"
+        message = (
+            f"You have uncommitted changes in '{config.file_path}'. These changes are included "
+            "in the current diff, but they will not be locked in history until committed."
         )
+        logger.warning(message)
+        warnings.append(message)
+    return warnings
+
+
+def has_uncommitted_changes(config: Config) -> bool:
+    """
+    Returns whether the tracked file has uncommitted working tree changes.
+    """
+    status = run_git_command(["status", "--porcelain", config.file_path], config.repo_dir)
+    return bool(status)
+
+
+def get_last_commit_info(config: Config) -> dict[str, str | None]:
+    """
+    Returns the most recent commit touching the tracked file.
+    """
+    output = run_git_command(
+        ["log", "-1", "--format=%H%x00%ci", "HEAD", "--", config.file_path],
+        config.repo_dir,
+    )
+    if not output:
+        return {"hash": None, "date": None}
+
+    parts = output.split("\x00", 1)
+    if len(parts) != 2:
+        return {"hash": parts[0], "date": None}
+    return {"hash": parts[0], "date": parts[1]}
 
 
 def calculate_progress(config: Config) -> list[ProgressRecord]:
@@ -222,6 +284,7 @@ def calculate_progress(config: Config) -> list[ProgressRecord]:
         if now < period_end:
             # Current (incomplete) period
             end_content = get_current_file_content(config.file_path, config)
+            commit_count_end = now
             locked = False
         else:
             # Locked (historical) period
@@ -231,9 +294,11 @@ def calculate_progress(config: Config) -> list[ProgressRecord]:
                 if end_commit
                 else ""
             )
+            commit_count_end = period_end
             locked = True
 
         diff_count = char_diff(start_content, end_content)
+        commit_count = get_commit_count_between(period_start, commit_count_end, config)
 
         records.append(
             ProgressRecord(
@@ -241,6 +306,7 @@ def calculate_progress(config: Config) -> list[ProgressRecord]:
                 Start=period_start.strftime("%Y-%m-%d %H:%M"),
                 End=period_end.strftime("%Y-%m-%d %H:%M"),
                 DiffChars=diff_count,
+                CommitCount=commit_count,
                 TargetMet="Yes" if diff_count >= config.min_chars else "No",
                 Locked="Yes" if locked else "No (Current)",
             )
@@ -263,21 +329,72 @@ def parse_args() -> Namespace:
     parser.add_argument("--csv-out", help="Path to the output CSV file")
     parser.add_argument("--min-chars", type=int, help="Minimum characters for goal")
     parser.add_argument("--interval-days", type=int, help="Interval in days for each period")
+    parser.add_argument("--json", action="store_true", dest="json_output", help="Print JSON output")
+    parser.add_argument(
+        "--no-auto-pull",
+        action="store_true",
+        help="Skip fetch and fast-forward merge before calculating progress",
+    )
     return parser.parse_args()
+
+
+def build_json_result(
+    config: Config, records: list[ProgressRecord], warnings: list[str]
+) -> dict[str, object]:
+    """
+    Builds a stable JSON result for native app integrations.
+    """
+    current_record = next(
+        (r for r in records if "No" in r.Locked), records[-1] if records else None
+    )
+    current_period = None
+    if current_record:
+        current_period = {
+            "period": current_record.Period,
+            "start": current_record.Start,
+            "end": current_record.End,
+            "diff_chars": current_record.DiffChars,
+            "commit_count": current_record.CommitCount,
+            "min_chars": config.min_chars,
+            "remaining_chars": max(0, config.min_chars - current_record.DiffChars),
+            "target_met": current_record.DiffChars >= config.min_chars,
+            "locked": current_record.Locked == "Yes",
+        }
+
+    return {
+        "repo_dir": config.repo_dir,
+        "file_path": config.file_path,
+        "min_chars": config.min_chars,
+        "interval_days": config.interval_days,
+        "current_period": current_period,
+        "records": [asdict(record) for record in records],
+        "has_uncommitted_changes": has_uncommitted_changes(config),
+        "last_commit": get_last_commit_info(config),
+        "warnings": warnings,
+    }
 
 
 def main() -> None:
     args = parse_args()
     config = Config.from_env_and_args(args)
+    warnings = []
 
     if not os.path.isdir(os.path.join(config.repo_dir, ".git")):
         logger.error("Repo directory '%s' is not a git repository.", config.repo_dir)
         sys.exit(1)
 
-    auto_pull(config)
-    check_uncommitted_changes(config)
+    if not os.path.exists(os.path.join(config.repo_dir, config.file_path)):
+        warnings.append(f"Tracked file '{config.file_path}' does not exist in the repo.")
+
+    if not args.no_auto_pull:
+        warnings.extend(auto_pull(config))
+    warnings.extend(check_uncommitted_changes(config))
 
     records = calculate_progress(config)
+
+    if args.json_output:
+        print(json.dumps(build_json_result(config, records, warnings), indent=2))
+        return
 
     # Write to CSV
     try:
@@ -312,14 +429,14 @@ def main() -> None:
     print("-" * 80)
     header = (
         f"{'Period':<6} | {'Start Date':<16} | {'End Date':<16}"
-        f" | {'Diff':<6} | {'Target Met':<10} | {'Locked'}"
+        f" | {'Diff':<6} | {'Commits':<7} | {'Target Met':<10} | {'Locked'}"
     )
     print(header)
     print("-" * 80)
     for r in records:
         row = (
             f"{r.Period:<6} | {r.Start:<16} | {r.End:<16}"
-            f" | {r.DiffChars:<6} | {r.TargetMet:<10} | {r.Locked}"
+            f" | {r.DiffChars:<6} | {r.CommitCount:<7} | {r.TargetMet:<10} | {r.Locked}"
         )
         print(row)
     print("-" * 80)

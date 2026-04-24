@@ -10,7 +10,10 @@ wheels/
 # Virtual environments
 .venv
 
+# Swift Package Manager
+.build/
+macos/Latexcop/.build/
+
 # Progress tracker
 progress.csv
 .env
-
