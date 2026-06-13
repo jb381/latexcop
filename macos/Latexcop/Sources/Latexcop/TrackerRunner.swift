@@ -113,6 +113,8 @@ struct TrackerRunner: Sendable {
 
             do {
                 try process.run()
+                try outputPipe.fileHandleForWriting.close()
+                try errorPipe.fileHandleForWriting.close()
             } catch {
                 continuation.resume(throwing: RunnerError.commandFailed(error.localizedDescription))
             }
