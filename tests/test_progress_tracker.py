@@ -9,11 +9,9 @@ from progress_tracker import (
     ProgressRecord,
     build_json_result,
     char_diff,
-    has_uncommitted_changes,
     parse_args,
     strip_latex_comments,
 )
-
 
 # ── strip_latex_comments ──────────────────────────────────────────────────────
 
